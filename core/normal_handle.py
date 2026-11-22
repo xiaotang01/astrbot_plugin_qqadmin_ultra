@@ -1,0 +1,257 @@
+"""基础群管动作：禁言/全员禁言/名片/头衔/踢/拉黑/管理员/精华/头像/群名。
+
+约定：方法只返回待发送的字符串（或 None 表无输出），不直接 send；
+权限与事件终止由 main 层装饰器处理。target_id 有值时走 LLM/程序调用，
+为空时从 @ 解析。
+"""
+
+from astrbot.api import logger
+from astrbot.core.message.components import Reply
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
+
+from ..config import PluginConfig
+from ..data import QQAdminDB, QQAdminGlobalList
+from ..utils import extract_image_url, format_time, get_nickname, get_target_ids
+
+
+class NormalHandle:
+    def __init__(
+        self,
+        config: PluginConfig,
+        db: QQAdminDB,
+        global_list: QQAdminGlobalList,
+    ):
+        self.cfg = config
+        self.db = db
+        self.global_list = global_list
+
+    async def set_group_ban(
+        self,
+        event: AiocqhttpMessageEvent,
+        ban_time: int | str | None = None,
+        target_id: str | int = "",
+    ):
+        group_config = self.db.get_group_snapshot(event.get_group_id())
+        # 规范化禁言时长：None/非法值走随机时长
+        if ban_time is not None:
+            try:
+                ban_time = int(str(ban_time).strip())
+            except (TypeError, ValueError):
+                ban_time = None
+        if ban_time is None:
+            ban_time = self.cfg.get_ban_time_with_range(group_config.get("random_ban_time"), None)
+        else:
+            ban_time = self.cfg.get_ban_time_with_range(group_config.get("random_ban_time"), ban_time)
+        tids = [target_id] if target_id else get_target_ids(event)
+        if not tids:
+            return "未指定要禁言的用户"
+        results = []
+        for tid in tids:
+            try:
+                await event.bot.set_group_ban(
+                    group_id=int(event.get_group_id()),
+                    user_id=int(tid),
+                    duration=ban_time,
+                )
+                results.append(f"用户[{tid}]已被禁言{ban_time}秒")
+            except Exception as e:
+                logger.warning(f"禁言用户{tid}失败: {e}")
+                results.append(f"用户[{tid}]禁言失败")
+        return "\n".join(results)
+
+    async def set_group_whole_ban(self, event: AiocqhttpMessageEvent, enable: bool):
+        await event.bot.set_group_whole_ban(group_id=int(event.get_group_id()), enable=enable)
+        return "已开启全体禁言" if enable else "已关闭全体禁言"
+
+    async def set_group_card(
+        self,
+        event: AiocqhttpMessageEvent,
+        target_id: str | int = "",
+        target_card: str | int = "",
+    ):
+        tids = ([target_id] if target_id else get_target_ids(event)) or [event.get_sender_id()]
+        results = []
+        for tid in tids:
+            try:
+                target_name = await get_nickname(event, user_id=tid)
+                await event.bot.set_group_card(
+                    group_id=int(event.get_group_id()),
+                    user_id=int(tid),
+                    card=str(target_card),
+                )
+                results.append(
+                    f"已修改{target_name}的群昵称为【{target_card}】" if target_card else f"已清除{target_name}的群昵称"
+                )
+            except Exception as e:
+                logger.warning(f"设置用户{tid}群昵称失败: {e}")
+                results.append(f"用户[{tid}]群昵称设置失败")
+        return "\n".join(results) if results else "未指定要设置群昵称的用户"
+
+    async def set_group_special_title(
+        self,
+        event: AiocqhttpMessageEvent,
+        target_id: str | int = "",
+        special_title: str | int = "",
+    ):
+        if special_title and len(str(special_title)) > 6:
+            return "头衔长度不能超过6个字符"
+        tids = ([target_id] if target_id else get_target_ids(event)) or [event.get_sender_id()]
+        results = []
+        for tid in tids:
+            try:
+                target_name = await get_nickname(event, user_id=tid)
+                await event.bot.set_group_special_title(
+                    group_id=int(event.get_group_id()),
+                    user_id=int(tid),
+                    special_title=str(special_title),
+                    duration=-1,
+                )
+                results.append(
+                    f"已修改{target_name}的头衔为【{special_title}】" if special_title else f"已清除{target_name}的头衔"
+                )
+            except Exception as e:
+                logger.warning(f"设置用户{tid}头衔失败: {e}")
+                results.append(f"用户[{tid}]头衔设置失败")
+        return "\n".join(results) if results else "未指定要设置头衔的用户"
+
+    async def set_group_kick(self, event: AiocqhttpMessageEvent, target_id: str | int = ""):
+        tids = [target_id] if target_id else get_target_ids(event)
+        results = []
+        for tid in tids:
+            try:
+                target_name = await get_nickname(event, user_id=tid)
+                await event.bot.set_group_kick(
+                    group_id=int(event.get_group_id()),
+                    user_id=int(tid),
+                    reject_add_request=False,
+                )
+                results.append(f"已将【{tid}-{target_name}】踢出本群")
+            except Exception as e:
+                logger.warning(f"踢出用户{tid}失败: {e}")
+                results.append(f"用户[{tid}]踢出失败")
+        return "\n".join(results) if results else "未指定要踢出的用户"
+
+    async def set_group_block(self, event: AiocqhttpMessageEvent, target_id: str | int = ""):
+        tids = [target_id] if target_id else get_target_ids(event)
+        results = []
+        for tid in tids:
+            try:
+                target_name = await get_nickname(event, user_id=tid)
+                await event.bot.set_group_kick(
+                    group_id=int(event.get_group_id()),
+                    user_id=int(tid),
+                    reject_add_request=True,
+                )
+                gid = event.get_group_id()
+                if await self.db.get(gid, "use_global_block", False):
+                    self.global_list.add("block", tid)
+                else:
+                    await self.db.add(gid, "block_ids", str(tid))
+                results.append(f"已将【{tid}-{target_name}】踢出本群并拉黑!")
+            except Exception as e:
+                logger.warning(f"拉黑用户{tid}失败: {e}")
+                results.append(f"用户[{tid}]拉黑失败")
+        return "\n".join(results) if results else "未指定要拉黑的用户"
+
+    async def set_group_admin(self, event: AiocqhttpMessageEvent, enable: bool):
+        results = []
+        for tid in get_target_ids(event):
+            try:
+                target_name = await get_nickname(event, user_id=tid)
+                await event.bot.set_group_admin(group_id=int(event.get_group_id()), user_id=int(tid), enable=enable)
+                msg = f"{target_name}已被设为管理员" if enable else f"{target_name}的管理员身份已被取消"
+                results.append(msg)
+            except Exception as e:
+                logger.warning(f"操作用户{tid}管理员身份失败: {e}")
+                results.append(f"用户[{tid}]管理员操作失败")
+        return "\n".join(results) if results else "未指定要操作的用户"
+
+    async def set_essence_msg(
+        self,
+        event: AiocqhttpMessageEvent,
+        enable: bool,
+        message_id: str | int = "",
+    ):
+        if not message_id:
+            chain = event.get_messages()
+            first_seg = chain[0] if chain else None
+            if not isinstance(first_seg, Reply):
+                return "未指定要设置精华的消息"
+            message_id = first_seg.id
+        if enable:
+            await event.bot.set_essence_msg(message_id=int(message_id))
+            return "已设为精华消息"
+        else:
+            await event.bot.delete_essence_msg(message_id=int(message_id))
+            return "已取消精华消息"
+
+    @staticmethod
+    def _flatten_essence_content(content) -> str:
+        """把 NapCat 的 content 段数组或 go-cqhttp 的纯文本压成一行摘要。"""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, dict):
+            return str(content.get("text", "")).strip()
+        if not isinstance(content, list):
+            return ""
+
+        parts: list[str] = []
+        for seg in content:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = seg.get("type")
+            data = seg.get("data") or {}
+            if seg_type == "text":
+                parts.append(str(data.get("text", "")))
+            elif seg_type == "image":
+                parts.append("[图片]")
+            elif seg_type == "at":
+                parts.append(f"@{data.get('qq', '')}")
+            elif seg_type in {"face", "mface"}:
+                parts.append("[表情]")
+        return "".join(parts).strip()
+
+    async def get_essence_msg_list(self, event: AiocqhttpMessageEvent):
+        """查看群精华"""
+        essence_data = await event.bot.get_essence_msg_list(group_id=int(event.get_group_id()))
+        if isinstance(essence_data, dict):
+            essence_data = essence_data.get("data") or []
+        if not isinstance(essence_data, list) or not essence_data:
+            return "没有群精华消息"
+
+        lines: list[str] = []
+        for idx, item in enumerate(essence_data, 1):
+            if not isinstance(item, dict):
+                continue
+            nickname = item.get("sender_nick") or item.get("sender_id") or "未知"
+            meta = [f"{idx}. {nickname}"]
+            if ts := item.get("sender_time") or item.get("operator_time"):
+                try:
+                    meta.append(format_time(int(ts)))
+                except (TypeError, ValueError):
+                    pass
+            if message_id := item.get("message_id"):
+                meta.append(f"ID:{message_id}")
+            lines.append(" ".join(meta))
+            summary = self._flatten_essence_content(item.get("message") or item.get("content"))
+            if summary:
+                lines.append(f"   {summary[:200]}")
+        return "\n".join(lines) if lines else "没有群精华消息"
+
+    async def set_group_portrait(self, event: AiocqhttpMessageEvent, image_url: str | None = None):
+        image_url = image_url or extract_image_url(chain=event.get_messages())
+        if not image_url:
+            return "未获取到新头像"
+        await event.bot.set_group_portrait(
+            group_id=int(event.get_group_id()),
+            file=image_url,
+        )
+        return "群头像已更新"
+
+    async def set_group_name(self, event: AiocqhttpMessageEvent, group_name: str | int | None = None):
+        if not group_name:
+            return "未输入新群名"
+        await event.bot.set_group_name(group_id=int(event.get_group_id()), group_name=str(group_name))
+        return f"本群群名更新为：{group_name}"

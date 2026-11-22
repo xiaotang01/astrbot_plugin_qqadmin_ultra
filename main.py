@@ -1,0 +1,582 @@
+"""插件入口：命令分发薄层，不写业务逻辑。
+
+结构速览（新人先看这里）：
+- QQAdminPlugin 只做装配：PluginConfig + QQAdminDB + QQGroupInfoCache +
+  各 Handle（normal/recall/notice/banpro/join/member/file/curfew）+ Web 面板。
+- 三类入口：@filter.command 群聊命令 / @filter.llm_tool LLM 工具 /
+  event_message_type 群事件监听（禁词/刷屏/进群退群）。
+- 权限统一走 permission.perm_required_for，LLM 走 permission.llm_guarded_for；
+  元数据全在 permission.specs；业务实现委托给 core/* Handle，
+  Handle 返回字符串，main 负责 yield 给事件。
+- 加新命令三步：1) permission.specs.COMMAND_SPECS 加一行权限元数据
+  2) 在 core 对应 Handle 写业务 3) 在此加一个薄委托方法。
+"""
+
+import asyncio
+
+from astrbot.api.event import filter
+from astrbot.api.star import Context, Star
+from astrbot.core import AstrBotConfig
+from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+    AiocqhttpMessageEvent,
+)
+from astrbot.core.star.filter.event_message_type import EventMessageType
+
+from .config import PluginConfig
+from .core import (
+    BanproHandle,
+    CurfewHandle,
+    FileHandle,
+    JoinHandle,
+    MemberHandle,
+    NormalHandle,
+    NoticeHandle,
+    RecallHandle,
+)
+from .data import QQAdminDB, QQAdminGlobalList
+from .group_cache import QQGroupInfoCache
+from .permission import (
+    llm_guarded_for,
+    perm_manager,
+    perm_required_for,
+)
+from .utils import parse_bool
+from .web import QQAdminWebController
+
+
+class QQAdminPlugin(Star):
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.context = context
+        self.cfg = PluginConfig(config, context)
+        self.db = QQAdminDB(self.cfg)
+        self.db.default_cfg = self.cfg.build_group_default_config()
+        self.group_cache = QQGroupInfoCache(context, self.db)
+        self.global_list = QQAdminGlobalList(self.cfg.data_dir)
+        self.normal = NormalHandle(self.cfg, self.db, self.global_list)
+        self.recall = RecallHandle()
+        self.notice = NoticeHandle(self.cfg)
+        self.banpro = BanproHandle(self.cfg, self.db)
+        self.join = JoinHandle(self.cfg, self.db, self.global_list, self.group_cache)
+        self.member = MemberHandle(self.db, self.global_list)
+        self.file = FileHandle(self.cfg)
+        self.curfew = CurfewHandle(self.context, self.cfg)
+        self.web = QQAdminWebController(
+            context, self.cfg, self.db, self.group_cache, self.global_list, self.banpro, self.join.state
+        )
+        self.web.register_routes()
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn_bg_task(self, coro) -> None:
+        """保留后台任务引用，避免任务被垃圾回收。"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def initialize(self):
+        await self.db.init()
+        self._spawn_bg_task(self.curfew.initialize())
+        perm_manager.lazy_init(self.cfg, self.db)
+
+    async def terminate(self):
+        await self.curfew.stop_all_tasks()
+        await self.db.close()
+
+    @filter.on_platform_loaded()
+    async def on_platform_loaded(self):
+        """平台加载完成时（已初始化的 Bot 会在内部跳过）"""
+        self._spawn_bg_task(self.curfew.initialize())
+
+    # ---------- 基础群管：禁言 / 名片 / 头衔 / 踢 / 精华 / 撤回 / 公告 ----------
+    @filter.command("禁言")
+    @perm_required_for("set_group_ban")
+    async def set_group_ban(self, event: AiocqhttpMessageEvent, ban_time=None):
+        """禁言 <秒数> @群友"""
+        result = await self.normal.set_group_ban(event, ban_time)
+        if result:
+            yield event.plain_result(result)
+        event.stop_event()
+
+    @filter.command("解禁")
+    @perm_required_for("cancel_group_ban")
+    async def cancel_group_ban(self, event: AiocqhttpMessageEvent):
+        """解禁 @群友"""
+        result = await self.normal.set_group_ban(event, ban_time=0)
+        if result:
+            yield event.plain_result(result)
+        event.stop_event()
+
+    @filter.command("全禁", alias={"全员禁言", "群全员禁言"})
+    @perm_required_for("set_group_whole_ban")
+    async def set_group_whole_ban(self, event: AiocqhttpMessageEvent, enable: bool | str = True):
+        """全禁 开/关, 开启或关闭群全员禁言"""
+        enable = parse_bool(enable, default=True)
+        if result := await self.normal.set_group_whole_ban(event, enable):
+            yield event.plain_result(result)
+
+    @filter.command("改名")
+    @perm_required_for("set_group_card")
+    async def set_group_card(self, event: AiocqhttpMessageEvent, target_card: str | int = ""):
+        """改名 <新昵称> @user"""
+        if result := await self.normal.set_group_card(event, target_card=target_card):
+            yield event.plain_result(result)
+
+    @filter.command("改头衔", alias={"头衔"})
+    @perm_required_for("set_group_special_title")
+    async def set_group_special_title(self, event: AiocqhttpMessageEvent, special_title: str | int = ""):
+        """改头衔 <新头衔> @群友"""
+        if result := await self.normal.set_group_special_title(event, special_title=special_title):
+            yield event.plain_result(result)
+
+    @filter.command("申请头衔", alias={"我要头衔"})
+    @perm_required_for("set_group_special_title_me")
+    async def set_group_special_title_me(self, event: AiocqhttpMessageEvent, special_title: str | int = ""):
+        """申请头衔 <新头衔>"""
+        if result := await self.normal.set_group_special_title(event, special_title=special_title):
+            yield event.plain_result(result)
+
+    @filter.command("踢了")
+    @perm_required_for("set_group_kick")
+    async def set_group_kick(self, event: AiocqhttpMessageEvent):
+        """踢了@群友"""
+        if result := await self.normal.set_group_kick(event):
+            yield event.plain_result(result)
+
+    @filter.command("群拉黑")
+    @perm_required_for("set_group_block")
+    async def set_group_block(self, event: AiocqhttpMessageEvent):
+        """群拉黑@群友"""
+        if result := await self.normal.set_group_block(event):
+            yield event.plain_result(result)
+
+    @filter.command("上管", alias={"设置管理员"})
+    @perm_required_for("set_group_admin")
+    async def set_group_admin(self, event: AiocqhttpMessageEvent):
+        """上管@群友，将群友设为管理员"""
+        if result := await self.normal.set_group_admin(event, enable=True):
+            yield event.plain_result(result)
+
+    @filter.command("下管", alias={"取消管理员"})
+    @perm_required_for("cancel_group_admin")
+    async def cancel_group_admin(self, event: AiocqhttpMessageEvent):
+        """下管@群友，取消群友的管理员身份"""
+        if result := await self.normal.set_group_admin(event, enable=False):
+            yield event.plain_result(result)
+
+    @filter.command("设精", alias={"设为精华"})
+    @perm_required_for("set_essence_msg")
+    async def set_essence_msg(self, event: AiocqhttpMessageEvent):
+        """(引用消息)设精, 将消息设为群精华"""
+        if result := await self.normal.set_essence_msg(event, enable=True):
+            yield event.plain_result(result)
+
+    @filter.command("移精", alias={"移除精华"})
+    @perm_required_for("delete_essence_msg")
+    async def delete_essence_msg(self, event: AiocqhttpMessageEvent):
+        """(引用消息)移精，将消息移除群精华"""
+        if result := await self.normal.set_essence_msg(event, enable=False):
+            yield event.plain_result(result)
+
+    @filter.command("群精华", alias={"查看群精华"})
+    @perm_required_for("get_essence_msg_list")
+    async def get_essence_msg_list(self, event: AiocqhttpMessageEvent):
+        """查看群精华"""
+        if result := await self.normal.get_essence_msg_list(event):
+            yield event.plain_result(result)
+
+    @filter.command("设置群头像")
+    @perm_required_for("set_group_portrait")
+    async def set_group_portrait(self, event: AiocqhttpMessageEvent):
+        """(引用图片)设置群头像"""
+        if result := await self.normal.set_group_portrait(event):
+            yield event.plain_result(result)
+
+    @filter.command("设置群名")
+    @perm_required_for("set_group_name")
+    async def set_group_name(self, event: AiocqhttpMessageEvent, group_name: str | int | None = None):
+        """设置群名 <新群名>"""
+        if result := await self.normal.set_group_name(event, group_name):
+            yield event.plain_result(result)
+
+    @filter.command("撤回")
+    @perm_required_for("delete_msg")
+    async def delete_msg(self, event: AiocqhttpMessageEvent):
+        """(引用消息)撤回 | 撤回 <@群友> <消息数量>"""
+        await self.recall.delete_msg(event)
+
+    @filter.command("发布群公告")
+    @perm_required_for("send_group_notice")
+    async def send_group_notice(self, event: AiocqhttpMessageEvent):
+        """(引用图片)发布群公告 <文字内容>"""
+        if result := await self.notice.send_group_notice(event):
+            yield event.plain_result(result)
+
+    @filter.command("群公告", alias={"查看群公告"})
+    @perm_required_for("get_group_notice")
+    async def get_group_notice(self, event: AiocqhttpMessageEvent):
+        """查看群公告"""
+        if result := await self.notice.get_group_notice(event):
+            yield event.plain_result(result)
+
+    # ---------- 违禁词 / 刷屏 / 投票 / 宵禁（业务在 core/banpro* 与 core/curfew*） ----------
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def on_ban_words(self, event: AiocqhttpMessageEvent):
+        """自动检测违禁词，撤回并禁言（管理员/超管豁免在 BanproHandle 内判断）"""
+        await self.banpro.on_ban_words(event)
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def spamming_ban(self, event: AiocqhttpMessageEvent):
+        """刷屏检测与禁言"""
+        await self.banpro.spamming_ban(event)
+
+    @filter.command("投票禁言")
+    @perm_required_for("start_vote_mute")
+    async def start_vote_mute(self, event: AiocqhttpMessageEvent, ban_time: int | None = None):
+        "投票禁言 <秒数> @群友"
+        await self.banpro.start_vote_mute(event, ban_time)
+
+    @filter.command("赞同禁言")
+    @perm_required_for("agree_vote_mute")
+    async def agree_vote_mute(self, event: AiocqhttpMessageEvent):
+        """同意执行当前禁言投票"""
+        await self.banpro.vote_mute(event, agree=True)
+
+    @filter.command("反对禁言")
+    @perm_required_for("disagree_vote_mute")
+    async def disagree_vote_mute(self, event: AiocqhttpMessageEvent):
+        """反对执行当前禁言投票"""
+        await self.banpro.vote_mute(event, agree=False)
+
+    @filter.command("取消投票")
+    @perm_required_for("cancel_vote_mute")
+    async def cancel_vote_mute(self, event: AiocqhttpMessageEvent):
+        """取消当前群正在进行的投票"""
+        await self.banpro.cancel_vote_mute(event)
+
+    @filter.command("投票踢人")
+    @perm_required_for("start_vote_kick")
+    async def start_vote_kick(self, event: AiocqhttpMessageEvent):
+        "投票踢人 @群友"
+        await self.banpro.start_vote_kick(event)
+
+    @filter.command("赞同踢人")
+    @perm_required_for("agree_vote_kick")
+    async def agree_vote_kick(self, event: AiocqhttpMessageEvent):
+        """同意执行当前踢出投票"""
+        await self.banpro.vote_mute(event, agree=True)
+
+    @filter.command("反对踢人")
+    @perm_required_for("disagree_vote_kick")
+    async def disagree_vote_kick(self, event: AiocqhttpMessageEvent):
+        """反对执行当前踢出投票"""
+        await self.banpro.vote_mute(event, agree=False)
+
+    @filter.command("开启宵禁")
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @perm_required_for("start_curfew")
+    async def start_curfew(
+        self,
+        event: AiocqhttpMessageEvent,
+        start_time: str | None = None,
+        end_time: str | None = None,
+    ):
+        """开启宵禁 HH:MM HH:MM"""
+        if result := await self.curfew.start_curfew(event, start_time, end_time):
+            yield event.plain_result(result)
+
+    @filter.command("关闭宵禁")
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    @perm_required_for("stop_curfew")
+    async def stop_curfew(self, event: AiocqhttpMessageEvent):
+        """关闭本群的宵禁任务"""
+        if result := await self.curfew.stop_curfew(event):
+            yield event.plain_result(result)
+
+    # ---------- 进群审批（业务在 core/join/*） ----------
+    @filter.command("批准", alias={"同意进群"})
+    @perm_required_for("agree_add_group")
+    async def agree_add_group(self, event: AiocqhttpMessageEvent, extra: str = ""):
+        "批准进群申请"
+        await self.join.agree_add_group(event, extra)
+
+    @filter.command("驳回", alias={"拒绝进群", "不批准"})
+    @perm_required_for("refuse_add_group")
+    async def refuse_add_group(self, event: AiocqhttpMessageEvent, extra: str = ""):
+        "驳回进群申请"
+        await self.join.refuse_add_group(event, extra)
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def event_monitoring(self, event: AiocqhttpMessageEvent):
+        """监听进群/退群事件"""
+        await self.join.event_monitoring(event)
+
+    # ---------- 群友管理 / 群文件 ----------
+    @filter.command("群友信息")
+    @perm_required_for("get_group_member_list")
+    async def get_group_member_list(self, event: AiocqhttpMessageEvent):
+        "查看群友信息"
+        await self.member.get_group_member_list(event)
+
+    @filter.command("清理群友")
+    @perm_required_for("clear_group_member")
+    async def clear_group_member(
+        self,
+        event: AiocqhttpMessageEvent,
+        inactive_days: int | None = None,
+        under_level: int | None = None,
+    ):
+        "清理群友 [未发言天数] [群等级]，缺省用本群配置"
+        await self.member.clear_group_member(event, inactive_days, under_level)
+
+    @filter.command("上传群文件")
+    @perm_required_for("upload_group_file")
+    async def upload_group_file(
+        self,
+        event: AiocqhttpMessageEvent,
+        path: str | int | None = None,
+    ):
+        "上传群文件 <文件夹名/文件名 | 文件名>"
+        if result := await self.file.upload_group_file(event, str(path)):
+            yield event.plain_result(result)
+
+    @filter.command("删除群文件")
+    @perm_required_for("delete_group_file")
+    async def delete_group_file(
+        self,
+        event: AiocqhttpMessageEvent,
+        path: str | int | None = None,
+    ):
+        "删除群文件 <文件夹名/序号> <文件名/序号>"
+        if result := await self.file.delete_group_file(event, str(path)):
+            yield event.plain_result(result)
+
+    @filter.command("查看群文件")
+    @perm_required_for("view_group_file")
+    async def view_group_file(
+        self,
+        event: AiocqhttpMessageEvent,
+        path: str | int | None = None,
+    ):
+        "查看群文件 <文件夹名/序号> <文件名/序号>"
+        if result := await self.file.view_group_file(event, path):
+            yield event.plain_result(result)
+
+    # ---------- LLM 工具（门禁由 COMMAND_SPECS 的 llm_tool 列派生，业务与群聊命令复用同一 Handle） ----------
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_ban")
+    async def llm_set_group_ban(
+        self,
+        event: AiocqhttpMessageEvent,
+        user_id: int,
+        duration: int,
+    ):
+        """
+        在群聊中禁言某用户，被禁言的用户在禁言期间将无法发送消息。
+        Args:
+            user_id(number): 要禁言的用户QQ
+            duration(number): 禁言持续时间（秒），范围为0~86400, 0表示取消禁言
+        """
+        return await self.normal.set_group_ban(event, ban_time=duration, target_id=user_id)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_card")
+    async def llm_set_group_card(
+        self,
+        event: AiocqhttpMessageEvent,
+        target_id: int,
+        target_card: str,
+    ):
+        """
+        给群聊中某用户设置群昵称。
+        Args:
+            target_id(number): 要设置群昵称的用户的QQ
+            target_card(string): 要设置的群昵称
+        """
+        return await self.normal.set_group_card(event, target_id=target_id, target_card=target_card)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_special_title")
+    async def llm_set_group_special_title(
+        self,
+        event: AiocqhttpMessageEvent,
+        target_id: int,
+        special_title: str,
+    ):
+        """
+        给群聊中某用户设置专属头衔。
+        Args:
+            target_id(number): 要设置头衔的用户的QQ
+            special_title(string): 要设置的新头衔
+        """
+        return await self.normal.set_group_special_title(event, target_id=target_id, special_title=special_title)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_whole_ban")
+    async def llm_set_group_whole_ban(
+        self,
+        event: AiocqhttpMessageEvent,
+        enable: bool = True,
+    ):
+        """
+        开启或关闭群全员禁言。
+        Args:
+            enable(boolean): 是否开启全员禁言。
+        """
+        return await self.normal.set_group_whole_ban(event, enable)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_kick")
+    async def llm_set_group_kick(
+        self,
+        event: AiocqhttpMessageEvent,
+        target_id: int,
+    ):
+        """
+        将指定用户踢出当前群聊(危险操作，本工具已强制鉴权)。
+        Args:
+            target_id(number): 要踢出的用户QQ。
+        """
+        return await self.normal.set_group_kick(event, target_id=target_id)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_block")
+    async def llm_set_group_block(
+        self,
+        event: AiocqhttpMessageEvent,
+        target_id: int,
+    ):
+        """
+        将指定用户踢出当前群聊并加入群黑名单(危险操作，本工具已强制鉴权)。
+        Args:
+            target_id(number): 要踢出并拉黑的用户QQ。
+        """
+        return await self.normal.set_group_block(event, target_id=target_id)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_essence_msg")
+    async def llm_set_essence_msg(
+        self,
+        event: AiocqhttpMessageEvent,
+        message_id: int,
+        enable: bool = True,
+    ):
+        """
+        设置或取消指定消息的群精华。
+        Args:
+            message_id(number): 要操作的消息ID。
+            enable(boolean): 是否设置为群精华，False表示取消群精华。
+        """
+        return await self.normal.set_essence_msg(event, enable=enable, message_id=message_id)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_get_essence_msg_list")
+    async def llm_get_essence_msg_list(
+        self,
+        event: AiocqhttpMessageEvent,
+    ):
+        """
+        查看当前群的群精华消息列表。
+        Args:
+        """
+        return await self.normal.get_essence_msg_list(event)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_name")
+    async def llm_set_group_name(
+        self,
+        event: AiocqhttpMessageEvent,
+        group_name: str,
+    ):
+        """
+        设置当前群的群名称。
+        Args:
+            group_name(string): 要设置的新群名称。
+        """
+        return await self.normal.set_group_name(event, group_name)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_set_group_portrait")
+    async def llm_set_group_portrait(
+        self,
+        event: AiocqhttpMessageEvent,
+        image_url: str,
+    ):
+        """
+        设置当前群的群头像。
+        Args:
+            image_url(string): 群头像图片URL或本地图片路径。
+        """
+        return await self.normal.set_group_portrait(event, image_url=image_url)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_send_group_notice")
+    async def llm_send_group_notice(
+        self,
+        event: AiocqhttpMessageEvent,
+        content: str,
+        image_url: str = "",
+    ):
+        """
+        发布一条群公告。
+        Args:
+            content(string): 群公告正文。
+            image_url(string): 可选的公告图片URL或本地图片路径。
+        """
+        return await self.notice.send_group_notice(event, content=content, image_url=image_url)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_get_group_notice")
+    async def llm_get_group_notice(
+        self,
+        event: AiocqhttpMessageEvent,
+    ):
+        """
+        查看当前群的群公告。
+        Args:
+        """
+        return await self.notice.get_group_notice(event)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_upload_group_file")
+    async def llm_upload_group_file(
+        self,
+        event: AiocqhttpMessageEvent,
+        path: str,
+    ):
+        """
+        上传本地文件到当前群的群文件。
+        Args:
+            path(string): 本地文件路径，可包含群文件夹路径。
+        """
+        return await self.file.upload_group_file(event, path)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_delete_group_file")
+    async def llm_delete_group_file(
+        self,
+        event: AiocqhttpMessageEvent,
+        path: str,
+    ):
+        """
+        删除当前群的群文件或群文件夹。
+        Args:
+            path(string): 群文件名、文件夹名或文件夹/文件名。
+        """
+        return await self.file.delete_group_file(event, path)
+
+    @filter.llm_tool()
+    @llm_guarded_for("llm_view_group_file")
+    async def llm_view_group_file(
+        self,
+        event: AiocqhttpMessageEvent,
+        path: str = "",
+    ):
+        """
+        查看当前群的群文件或群文件夹。
+        Args:
+            path(string): 可选的文件名、文件夹名或文件夹/文件名，留空查看根目录。
+        """
+        return await self.file.view_group_file(event, path)

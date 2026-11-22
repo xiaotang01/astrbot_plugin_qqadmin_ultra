@@ -1,0 +1,245 @@
+# config.py
+"""配置层：AstrBot 原生配置的强类型包装 + 运行时路径。
+
+- ConfigNode：把 dict 变成属性访问。声明字段（类型注解）读写底层 dict；
+  未声明/_开头字段只挂属性。嵌套 ConfigNode 懒加载并缓存。
+  例：cfg.vote_ban.ttl 读写的是底层 dict["vote_ban"]["ttl"]。
+- PluginConfig（根节点，唯一可 save_config）：聚合 default/admin_audit/
+  random_ban_time/vote_ban/llm_get_msg_count/perms，并派生 data_dir、
+  db_path、词库/宵禁/群文件路径。random_ban_time 形如 "30~300"，
+  非法时回退 30~300 并写回。
+"""
+
+import copy
+import json
+import random
+from collections.abc import MutableMapping
+from pathlib import Path
+from types import UnionType
+from typing import Any, Union, get_args, get_origin, get_type_hints
+
+from astrbot.api import logger
+from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.star.context import Context
+from astrbot.core.star.star_tools import StarTools
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_path
+
+
+class ConfigNode:
+    """
+    配置节点, 把 dict 变成强类型对象。
+
+    规则：
+    - schema 来自子类类型注解
+    - 声明字段：读写，写回底层 dict
+    - 未声明字段和下划线字段：仅挂载属性，不写回
+    - 支持 ConfigNode 多层嵌套（lazy + cache）
+    """
+
+    _SCHEMA_CACHE: dict[type, dict[str, type]] = {}
+    _FIELDS_CACHE: dict[type, set[str]] = {}
+
+    @classmethod
+    def _schema(cls) -> dict[str, type]:
+        return cls._SCHEMA_CACHE.setdefault(cls, get_type_hints(cls))
+
+    @classmethod
+    def _fields(cls) -> set[str]:
+        return cls._FIELDS_CACHE.setdefault(
+            cls,
+            {k for k in cls._schema() if not k.startswith("_")},
+        )
+
+    @staticmethod
+    def _is_optional(tp: type) -> bool:
+        if get_origin(tp) in (Union, UnionType):
+            return type(None) in get_args(tp)
+        return False
+
+    def __init__(self, data: MutableMapping[str, Any]):
+        object.__setattr__(self, "_data", data)
+        object.__setattr__(self, "_children", {})
+        for key, tp in self._schema().items():
+            if key.startswith("_"):
+                continue
+            if key in data:
+                continue
+            if hasattr(self.__class__, key):
+                continue
+            if self._is_optional(tp):
+                continue
+            logger.warning(f"[config:{self.__class__.__name__}] 缺少字段: {key}")
+
+    def __getattr__(self, key: str) -> Any:
+        if key in self._fields():
+            value = self._data.get(key)
+            tp = self._schema().get(key)
+
+            if isinstance(tp, type) and issubclass(tp, ConfigNode):
+                children: dict[str, ConfigNode] = self.__dict__["_children"]
+                if key not in children:
+                    if not isinstance(value, MutableMapping):
+                        raise TypeError(
+                            f"[config:{self.__class__.__name__}] 字段 {key} 期望 dict，实际是 {type(value).__name__}"
+                        )
+                    children[key] = tp(value)
+                return children[key]
+
+            return value
+
+        if key in self.__dict__:
+            return self.__dict__[key]
+
+        raise AttributeError(key)
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        if key in self._fields():
+            self._data[key] = value
+            return
+        object.__setattr__(self, key, value)
+
+    def save_config(self) -> None:
+        """
+        保存配置到磁盘（仅允许在根节点调用）
+        """
+        if not isinstance(self._data, AstrBotConfig):
+            raise RuntimeError(f"{self.__class__.__name__}.save_config() 只能在根配置节点上调用")
+        self._data.save_config()
+
+
+# ============ 插件自定义配置 ==================
+
+
+class VoteBanConfig(ConfigNode):
+    ttl: int
+    threshold: int
+
+
+class PluginConfig(ConfigNode):
+    default: dict
+    admin_audit: bool
+    random_ban_time: str
+    vote_ban: VoteBanConfig
+    llm_get_msg_count: int
+    perms: dict
+
+    _db_version = 3
+    _plugin_name: str = "astrbot_plugin_qqadmin_ultra"
+
+    def __init__(self, cfg: AstrBotConfig, context: Context):
+        super().__init__(cfg)
+        self.context = context
+        self.admins_id = self._clean_ids(context.get_config().get("admins_id", []))
+
+        self.data_dir = StarTools.get_data_dir(self._plugin_name)
+        self.plugin_dir = Path(get_astrbot_plugin_path()) / self._plugin_name
+        self.schema = self._load_schema()
+
+        self.db_path = self.data_dir / f"qqadmin_data_v{self._db_version}.db"
+        self.ban_lexicon_path = self.plugin_dir / "SensitiveLexicon.json"
+        self.global_ban_lexicon_path = self.data_dir / "global_ban_words.json"
+        self.group_notice_dir = self.data_dir / "group_notice"
+        self.group_notice_dir.mkdir(parents=True, exist_ok=True)
+        self.curfew_file = self.data_dir / "curfew_data.json"
+        if not self.curfew_file.exists():
+            self.curfew_file.write_text("{}", encoding="utf-8")
+        self.file_dir = self.data_dir / "file"
+        self.file_dir.mkdir(parents=True, exist_ok=True)
+
+        self.spamming_count = 5
+        self.spamming_interval = 0.5
+        self.refresh_runtime_settings()
+
+    @staticmethod
+    def _clean_ids(ids: list) -> list[str]:
+        """过滤并规范化数字 ID"""
+        return [str(i) for i in ids if str(i).isdigit()]
+
+    def get_ban_time(self, seconds=None) -> int:
+        """获取禁言时间"""
+        if seconds is None or not isinstance(seconds, int):
+            return random.randint(self.min_ban_time, self.max_ban_time)
+        else:
+            return min(max(seconds, 0), 2592000)
+
+    @staticmethod
+    def _parse_ban_time_range(random_ban_time: str) -> tuple[int, int]:
+        """解析 "min~max" 范围，格式非法时抛出 ValueError。"""
+        min_ban_time, max_ban_time = map(int, str(random_ban_time).split("~", 1))
+        min_ban_time = max(min_ban_time, 1)
+        max_ban_time = min(max(max_ban_time, min_ban_time), 2592000)
+        return min_ban_time, max_ban_time
+
+    @staticmethod
+    def _resolve_ban_time_range(random_ban_time: str) -> tuple[int, int]:
+        """解析 "min~max" 范围，格式非法时回退到 30~300。"""
+        try:
+            return PluginConfig._parse_ban_time_range(random_ban_time)
+        except ValueError:
+            return 30, 300
+
+    def get_ban_time_with_range(self, random_ban_time: str | None, seconds: int | None = None) -> int:
+        if not random_ban_time:
+            return self.get_ban_time(seconds)
+
+        min_ban_time, max_ban_time = self._resolve_ban_time_range(random_ban_time)
+        if seconds is None or not isinstance(seconds, int):
+            return random.randint(min_ban_time, max_ban_time)
+        return min(max(seconds, 0), 2592000)
+
+    def _load_schema(self) -> dict[str, Any]:
+        """读取插件 _conf_schema.json（字段集合的唯一来源）。"""
+        try:
+            return json.loads((self.plugin_dir / "_conf_schema.json").read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[config:{self.__class__.__name__}] 读取 _conf_schema.json 失败: {e}")
+            return {}
+
+    def build_group_default_config(self) -> dict[str, Any]:
+        """默认群模板：键集合以 schema 为准，值取当前配置。
+
+        以 schema 作为唯一键来源，删除字段后配置里残留的旧键不会继续出现在
+        模板中，数据库迁移据此清理历史行，后续增删改字段无需改代码。
+        """
+        schema_default = self.schema.get("default", {}).get("items", {})
+        schema_perms = self.schema.get("perms", {}).get("items", {})
+        if schema_default:
+            group_cfg = {
+                key: copy.deepcopy(self.default.get(key, spec.get("default"))) for key, spec in schema_default.items()
+            }
+            perms = {key: self.perms.get(key, spec.get("default")) for key, spec in schema_perms.items()}
+        else:
+            # schema 缺失时退回原样合并，避免把所有群配置字段清空
+            group_cfg = dict(self.default)
+            perms = dict(self.perms)
+        group_cfg.update(
+            {
+                "admin_audit": self.admin_audit,
+                "random_ban_time": self.random_ban_time,
+                "vote_ban": {
+                    "ttl": self.vote_ban.ttl,
+                    "threshold": self.vote_ban.threshold,
+                },
+                "llm_get_msg_count": self.llm_get_msg_count,
+                "perms": perms,
+            }
+        )
+        return group_cfg
+
+    def refresh_runtime_settings(self) -> None:
+        """刷新依赖配置的运行时缓存。"""
+        try:
+            min_ban_time, max_ban_time = self._parse_ban_time_range(str(self.random_ban_time))
+        except ValueError:
+            logger.warning(
+                f"[config:{self.__class__.__name__}] random_ban_time 格式错误: {self.random_ban_time}，已回退到 30~300"
+            )
+            min_ban_time, max_ban_time = 30, 300
+            self.random_ban_time = "30~300"
+            try:
+                self.save_config()
+            except Exception as e:
+                logger.error(f"[config:{self.__class__.__name__}] random_ban_time 修复写回失败: {e}")
+
+        self.min_ban_time = max(min_ban_time, 1)
+        self.max_ban_time = min(max(max_ban_time, self.min_ban_time), 2592000)

@@ -1,0 +1,310 @@
+"""Web 控制器：插件可视化视图后端，路由薄层，鉴权由 Dashboard 转发统一处理。
+
+- register_routes 注册 /api/v1/plugins/extensions/astrbot_plugin_qqadmin_ultra/*；
+  前端经 window.AstrBotPluginView bridge 用相对路径（如 settings/bootstrap）调用。
+- 请求/响应使用 astrbot.api.web（要求 AstrBot >= 4.26.0，见 metadata.yaml）；
+  _wrap_handler 统一把 ValueError 转 400、未知异常转 500。
+- 具体逻辑委托 QQAdminPageService，本文件只做参数解析。
+"""
+
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.api.star import Context
+from astrbot.api.web import error_response, json_response
+from astrbot.api.web import request as web_request
+
+from .config import PluginConfig
+from .core.banpro import BanproHandle
+from .core.join.state import JoinState
+from .data import QQAdminDB, QQAdminGlobalList
+from .group_cache import QQGroupInfoCache
+from .page_service import QQAdminPageService
+
+PLUGIN_NAME = "astrbot_plugin_qqadmin_ultra"
+
+
+class QQAdminWebController:
+    """前端面板路由；Dashboard 经 bridge 转发并统一鉴权，本插件不再额外校验。"""
+
+    def __init__(
+        self,
+        context: Context,
+        cfg: PluginConfig,
+        db: QQAdminDB,
+        group_cache: QQGroupInfoCache,
+        global_list: QQAdminGlobalList,
+        banpro: BanproHandle,
+        join_state: JoinState | None = None,
+    ):
+        self.context = context
+        self.service = QQAdminPageService(cfg, db, group_cache, global_list, banpro, join_state, context)
+
+    def register_routes(self) -> None:
+        routes = [
+            (
+                "/ping",
+                self.page_ping,
+                ["GET"],
+                "Page ping",
+            ),
+            (
+                "/settings/bootstrap",
+                self.page_bootstrap,
+                ["GET"],
+                "Load settings page bootstrap data",
+            ),
+            (
+                "/settings/groups/refresh",
+                self.page_refresh_groups,
+                ["POST"],
+                "Refresh QQ group list",
+            ),
+            (
+                "/settings/groups/calibrate",
+                self.page_calibrate_groups,
+                ["POST"],
+                "Calibrate cached QQ groups with live details",
+            ),
+            (
+                "/settings/groups/roles",
+                self.page_refresh_group_roles,
+                ["POST"],
+                "Load bot roles for QQ groups",
+            ),
+            (
+                "/settings/group",
+                self.page_get_group,
+                ["GET"],
+                "Load one group config",
+            ),
+            (
+                "/settings/group",
+                self.page_update_group,
+                ["POST"],
+                "Update one group config",
+            ),
+            (
+                "/settings/group/reset",
+                self.page_reset_group,
+                ["POST"],
+                "Reset one group config",
+            ),
+            (
+                "/settings/global-list",
+                self.page_get_global_lists,
+                ["GET"],
+                "Get global allow/block lists",
+            ),
+            (
+                "/settings/global-list",
+                self.page_update_global_list,
+                ["POST"],
+                "Update global allow/block list",
+            ),
+            (
+                "/settings/global-ban-words",
+                self.page_get_global_ban_words,
+                ["GET"],
+                "Get global and available builtin ban words",
+            ),
+            (
+                "/settings/global-ban-words",
+                self.page_update_global_ban_words,
+                ["POST"],
+                "Update global ban words",
+            ),
+            (
+                "/settings/global-ban-words/import",
+                self.page_import_builtin_ban_words,
+                ["POST"],
+                "Import builtin ban words into global ban words",
+            ),
+            (
+                "/settings/global-ban-words/restore",
+                self.page_restore_builtin_ban_words,
+                ["POST"],
+                "Restore global ban words from builtin ban words",
+            ),
+            (
+                "/settings/pending",
+                self.page_get_pending,
+                ["GET"],
+                "List pending join approvals",
+            ),
+            (
+                "/settings/pending/drop",
+                self.page_drop_pending_entry,
+                ["POST"],
+                "Drop one pending join approval",
+            ),
+            (
+                "/settings/pending/drop-stale",
+                self.page_drop_pending_stale,
+                ["POST"],
+                "Drop expired pending join approvals",
+            ),
+            (
+                "/settings/pending/approve",
+                self.page_approve_pending,
+                ["POST"],
+                "Approve a pending join request",
+            ),
+            (
+                "/settings/pending/reject",
+                self.page_reject_pending,
+                ["POST"],
+                "Reject a pending join request",
+            ),
+        ]
+        for path, handler, methods, desc in routes:
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}{path}",
+                self._wrap_handler(handler),
+                methods,
+                desc,
+            )
+
+    @staticmethod
+    def _jsonify(payload: dict[str, Any]):
+        return json_response(payload)
+
+    @staticmethod
+    def _fail(message: str, status_code: int):
+        return error_response(message, status_code=status_code)
+
+    @staticmethod
+    async def _json_body() -> dict[str, Any]:
+        payload = await web_request.json(default={})
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _query() -> Mapping[str, Any]:
+        return web_request.query
+
+    @staticmethod
+    def _parse_flag(payload: Any, key: str, default: bool) -> bool:
+        """解析 0/1 开关参数：缺省或无法识别时回退到 default。"""
+        raw = str(payload.get(key, "") or "").strip().lower()
+        if not raw:
+            return default
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    def _wrap_handler(self, handler: Callable[[], Awaitable]) -> Callable[[], Awaitable]:
+        async def wrapped():
+            try:
+                return await handler()
+            except ValueError as exc:
+                return self._fail(str(exc), 400)
+            except Exception as exc:
+                logger.exception("QQAdmin page request failed")
+                return self._fail(str(exc), 500)
+
+        wrapped.__name__ = handler.__name__
+        return wrapped
+
+    async def page_ping(self):
+        return self._jsonify({"ok": True, "message": "pong"})
+
+    async def page_bootstrap(self):
+        return self._jsonify({"ok": True, "data": await self.service.get_bootstrap_payload()})
+
+    async def page_refresh_groups(self):
+        payload = await self._json_body()
+        with_details = self._parse_flag(payload, "details", True)
+        data = await self.service.list_groups_with_status(force=True, with_details=with_details)
+        return self._jsonify({"ok": True, "data": data})
+
+    async def page_calibrate_groups(self):
+        return self._jsonify({"ok": True, "data": await self.service.calibrate_groups()})
+
+    async def page_refresh_group_roles(self):
+        payload = await self._json_body()
+        force = self._parse_flag(payload, "force", False)
+        prune = self._parse_flag(payload, "prune", True)
+        return self._jsonify({"ok": True, "data": await self.service.list_groups_with_bot_roles(force, prune)})
+
+    async def page_get_group(self):
+        query = self._query()
+        group_id = str(query.get("group_id", ""))
+        force = self._parse_flag(query, "force", False)
+        return self._jsonify(
+            {
+                "ok": True,
+                "data": await self.service.get_group_config(group_id, force=force),
+            }
+        )
+
+    async def page_update_group(self):
+        payload = await self._json_body()
+        group_id = payload.get("group_id")
+        config = payload.get("config")
+        result = await self.service.update_group_config(group_id, config)
+        return self._jsonify({"ok": True, "message": "Group config saved", "data": result})
+
+    async def page_reset_group(self):
+        payload = await self._json_body()
+        group_id = payload.get("group_id")
+        result = await self.service.reset_group_config(group_id)
+        return self._jsonify({"ok": True, "message": "Group config reset", "data": result})
+
+    async def page_get_global_lists(self):
+        data = await self.service.get_global_lists()
+        return self._jsonify({"ok": True, "data": data})
+
+    async def page_update_global_list(self):
+        payload = await self._json_body()
+        list_type = payload.get("type", "")
+        items = payload.get("items", [])
+        result = await self.service.update_global_list(list_type, items)
+        return self._jsonify(
+            {"ok": True, "message": f"全局{'白名单' if list_type == 'allow' else '黑名单'}已更新", "data": result}
+        )
+
+    async def page_get_global_ban_words(self):
+        return self._jsonify({"ok": True, "data": await self.service.get_global_ban_words()})
+
+    async def page_update_global_ban_words(self):
+        payload = await self._json_body()
+        words = await self.service.update_global_ban_words(payload.get("words", []))
+        return self._jsonify({"ok": True, "message": "全局禁词已更新", "data": words})
+
+    async def page_import_builtin_ban_words(self):
+        payload = await self._json_body()
+        words = await self.service.import_builtin_ban_words(payload.get("words", []))
+        return self._jsonify({"ok": True, "message": "内置禁词已导入", "data": words})
+
+    async def page_restore_builtin_ban_words(self):
+        words = await self.service.restore_builtin_ban_words()
+        return self._jsonify({"ok": True, "message": "已恢复内置禁词", "data": words})
+
+    async def page_get_pending(self):
+        query = self._query()
+        gid = str(query.get("group_id", "") or "").strip() or None
+        return self._jsonify({"ok": True, "data": await self.service.list_pending_approvals(gid)})
+
+    async def page_drop_pending_entry(self):
+        payload = await self._json_body()
+        count = await self.service.drop_pending_entry(str(payload.get("key", "")))
+        return self._jsonify({"ok": True, "message": f"已清除 {count} 条待审核", "data": {"cleared": count}})
+
+    async def page_drop_pending_stale(self):
+        count = await self.service.drop_pending_stale()
+        return self._jsonify({"ok": True, "message": f"已清除 {count} 条过期待审核", "data": {"cleared": count}})
+
+    async def page_approve_pending(self):
+        payload = await self._json_body()
+        message = await self.service.settle_pending(str(payload.get("key", "")), True)
+        return self._jsonify({"ok": True, "message": message})
+
+    async def page_reject_pending(self):
+        payload = await self._json_body()
+        message = await self.service.settle_pending(
+            str(payload.get("key", "")), False, str(payload.get("reason", "") or "")
+        )
+        return self._jsonify({"ok": True, "message": message})

@@ -93,6 +93,12 @@
         "type": "bool",
         "default": false
       },
+      "join_invite_auto": {
+        "description": "被邀请入群自动同意",
+        "hint": "群内成员邀请他人入群时，开启则直接同意（等同命中白词）；关闭则转人工审核。不套用黑名单、等级、关键词等申请人规则",
+        "type": "bool",
+        "default": true
+      },
       "join_silent_reasons": {
         "description": "免通知类型",
         "hint": "勾选后，自动批准/驳回结果命中时不发送通知",
@@ -595,6 +601,7 @@
           "join_pending_msg",
           "join_pending_ttl",
           "join_single_group",
+          "join_invite_auto",
           "reject_word_block",
           "join_silent_reasons",
           "admin_audit"

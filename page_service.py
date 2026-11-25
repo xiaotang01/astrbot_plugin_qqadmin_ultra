@@ -396,6 +396,7 @@ class QQAdminPageService:
         if not entry:
             raise ValueError("待审核记录不存在")
         flag = str(entry.get("flag") or "")
+        sub_type = str(entry.get("sub_type") or "add")
         nickname = str(entry.get("nickname") or "") or "该用户"
         if not flag:
             raise ValueError("该记录缺少 flag，请在群内处理")
@@ -403,7 +404,10 @@ class QQAdminPageService:
         for bot in self._resolve_qq_bots(entry.get("platform_id")):
             try:
                 await bot.set_group_add_request(
-                    flag=flag, sub_type="add", approve=approve, reason="" if approve else reason
+                    flag=flag,
+                    sub_type=sub_type,
+                    approve=approve,
+                    reason="" if approve or sub_type == "invite" else reason,
                 )
             except Exception as e:
                 err = str(e).lower()
@@ -414,6 +418,8 @@ class QQAdminPageService:
                 continue
             state.drop_application_by_flag(flag)
             state.drop_pending(lambda k, r: r.get("flag") == flag)
+            if sub_type == "invite":
+                return f"已{'同意' if approve else '拒绝'}{nickname}的进群邀请"
             if approve:
                 return f"已同意{nickname}进群"
             return f"已拒绝{nickname}进群" + (f"\n理由：{reason}" if reason else "")

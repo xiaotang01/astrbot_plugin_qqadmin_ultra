@@ -1,5 +1,17 @@
 # 更新日志
 
+## v3.5.2（Fork）
+
+新功能:
+
+- 群邀请审批：新增 `join_invite_auto`（默认开启）。开启时群成员邀请他人入群直接同意，等同命中白词（结果代号 `white_word`，默认在「免通知类型」中，即静默进群）；关闭时转人工审核，可引用通知回复「批准 / 驳回」或在面板审批。群邀请不套用黑名单、等级、关键词、满群、多群申请等申请人规则。
+- 群邀请通知：与主动申请共用同一条通知链路，按 `admin_audit` 决定发群还是私聊管理员；通知标题为「群邀请」，人员字段显示为“邀请人”。
+
+修复:
+
+- 群邀请事件（`post_type=request`、`request_type=group`、`sub_type=invite`）此前只打一条 debug 日志后被直接忽略，导致被邀请入群既不提示也无法自动通过。
+- 群邀请审批的 `sub_type` 原先硬编码为 `add`，协议端会判为无效请求；现按请求事件在待审批记录中保存 `sub_type`，人工与面板审批均原样回传，邀请场景不再传 `reason`。
+
 ## Fork 改动（基于上游 v3.5.1）
 
 本项目（QQ群管Ultra）为 [MengNianxiaoyao/astrbot_plugin_qqadmin_plus](https://github.com/MengNianxiaoyao/astrbot_plugin_qqadmin_plus) 的个人 Fork，以下为相对上游的全部改动，主要用于适配 SnowLuma（SL）协议端。

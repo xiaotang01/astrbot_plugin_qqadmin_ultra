@@ -70,12 +70,14 @@ class JoinEvents:
         client = event.bot
         uid: str = str(raw.get("user_id", ""))
 
-        # 进群申请事件
-        if raw.get("post_type") == "request" and raw.get("request_type") == "group" and raw.get("sub_type") == "add":
-            await self._on_join_request(event, raw, gid, uid, client)
-        elif raw.get("post_type") == "request" and raw.get("request_type") == "group":
-            # 非加群申请（如邀请入群）：本插件只处理主动申请
-            logger.debug(f"忽略非主动加群请求: gid={gid} uid={uid} sub_type={raw.get('sub_type')}")
+        # 群请求事件：add 主动申请入群；invite 群内成员邀请他人入群
+        if raw.get("post_type") == "request" and raw.get("request_type") == "group":
+            if raw.get("sub_type") == "add":
+                await self._on_join_request(event, raw, gid, uid, client)
+            elif raw.get("sub_type") == "invite":
+                await self._on_invite_request(event, raw, gid, uid, client)
+            else:
+                logger.debug(f"忽略未知群请求: gid={gid} uid={uid} sub_type={raw.get('sub_type')}")
         # 主动退群事件
         elif (
             raw.get("post_type") == "notice"
@@ -116,12 +118,76 @@ class JoinEvents:
         if approve is True:
             self.state.clear_fail(f"{gid}_{uid}")
 
+        await self._apply_and_notify(
+            event, client, gid, uid, nickname, flag, comment, level, approve, reason, code
+        )
+
+    async def _on_invite_request(self, event: AiocqhttpMessageEvent, raw: dict, gid: str, uid: str, client):
+        """群内成员邀请他人入群（OneBot 群请求 sub_type=invite）。
+
+        判定只由“被邀请入群自动同意”开关决定：开启等同命中白词直接同意，关闭走人工审核；
+        邀请人必在群内、bot 也在群内，通知走与其他进群事件相同的 admin_audit 路径。
+        """
+        if not await self.db.get(gid, "join_switch"):
+            logger.debug(f"进群审核未开启，跳过群邀请: gid={gid} uid={uid}")
+            return
+        comment = raw.get("comment")
+        flag = str(raw.get("flag", ""))
+        try:
+            info = await client.get_stranger_info(user_id=int(uid)) or {}
+        except Exception as e:
+            logger.warning(f"获取邀请人 {uid} 资料失败: {e}")
+            info = {}
+        nickname = info.get("nickname") or "未知昵称"
+
+        if await self.db.get(gid, "join_invite_auto", True):
+            # 与命中白词同路：自动同意，命中免通知配置时同样不打扰
+            approve, reason, code = True, "被邀请入群", "white_word"
+        else:
+            approve, reason, code = None, "人工审核", "manual"
+        await self._apply_and_notify(
+            event,
+            client,
+            gid,
+            uid,
+            nickname,
+            flag,
+            comment,
+            None,
+            approve,
+            reason,
+            code,
+            sub_type="invite",
+            title="群邀请",
+        )
+
+    async def _apply_and_notify(
+        self,
+        event: AiocqhttpMessageEvent,
+        client: CQHttp,
+        gid: str,
+        uid: str,
+        nickname: str,
+        flag: str,
+        comment,
+        level: int | None,
+        approve: bool | None,
+        reason: str,
+        code: str,
+        sub_type: str = "add",
+        title: str = "进群申请",
+    ):
+        """按判定结果落定群请求并发送通知（主动申请与群邀请共用）。
+
+        sub_type 必须与请求事件一致：主动申请用 add，邀请入群用 invite，
+        写错会被协议端判为无效请求。
+        """
         # 自动审核
         if approve is not None:
             try:
                 await client.set_group_add_request(
                     flag=flag,
-                    sub_type="add",
+                    sub_type=sub_type,
                     approve=approve,
                     reason="" if approve else reason,
                 )
@@ -146,7 +212,10 @@ class JoinEvents:
         # 生成并发送通知
         group_name = await self._get_group_name(gid)
         tip = "批准/驳回" if approve is None else "自动审核"
-        notice = f"【进群申请-{tip}】\n群：{group_name}\n昵称：{nickname}\nQQ：{uid}\nflag：{flag}\n等级：{level}"
+        name_label = "邀请人" if sub_type == "invite" else "昵称"
+        notice = f"【{title}-{tip}】\n群：{group_name}\n{name_label}：{nickname}\nQQ：{uid}\nflag：{flag}"
+        if level is not None:
+            notice += f"\n等级：{level}"
         # 验证消息首尾的空白/换行只会影响排版，拼入前先清理，避免与分隔 \n 叠出空行
         if comment_text := str(comment).strip() if comment else "":
             notice += f"\n{comment_text}"
@@ -168,7 +237,14 @@ class JoinEvents:
             except Exception:
                 platform_id = None
             self.state.track_pending(
-                mid, gid, uid, nickname, flag, platform_id, comment if isinstance(comment, str) else None
+                mid,
+                gid,
+                uid,
+                nickname,
+                flag,
+                platform_id,
+                comment if isinstance(comment, str) else None,
+                sub_type=sub_type,
             )
 
     async def _on_leave(self, event: AiocqhttpMessageEvent, gid: str, uid: str):

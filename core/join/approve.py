@@ -54,7 +54,11 @@ class JoinApprover:
         # A1：兜底从通知文本中按内容定位解析（不依赖固定行号）；拿不到文本时只靠 A2
         if flag is None and text:
             try:
-                nickname = self._extract_field(text, "昵称：") or nickname
+                nickname = (
+                    self._extract_field(text, "昵称：")
+                    or self._extract_field(text, "邀请人：")
+                    or nickname
+                )
                 flag = self._extract_field(text, "flag：") or flag
             except Exception as e:
                 logger.error(f"解析进群申请引用失败: {e}")
@@ -63,13 +67,27 @@ class JoinApprover:
         if not flag:
             return "引用的可能不是【进群申请】或该申请已失效"
 
+        # 邀请入群与主动申请共用审批接口，但 sub_type 必须与请求事件一致（invite/add）
+        sub_type = str(pending_entry.get("sub_type") or "add") if pending_entry else "add"
+        if pending_entry is None:
+            matched = self.state.pending_entry_by_flag(flag)
+            if matched:
+                sub_type = str(matched.get("sub_type") or "add")
+
         nickname = nickname or "该用户"
         try:
-            await event.bot.set_group_add_request(flag=flag, sub_type="add", approve=approve, reason=extra)
+            await event.bot.set_group_add_request(
+                flag=flag,
+                sub_type=sub_type,
+                approve=approve,
+                reason="" if approve or sub_type == "invite" else extra,
+            )
             # 人工落定后清除跨群申请记录与待审批登记（引用/兜底路径统一按 flag 清）
             self.state.drop_application_by_flag(flag)
             self.state.drop_pending(lambda k, r: r.get("flag") == flag)
-            if approve:
+            if sub_type == "invite":
+                reply = f"已{'同意' if approve else '拒绝'}{nickname}的进群邀请"
+            elif approve:
                 reply = f"已同意{nickname}进群"
             else:
                 reply = f"已拒绝{nickname}进群" + (f"\n理由：{extra}" if extra else "")

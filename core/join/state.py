@@ -77,6 +77,12 @@ class JoinState:
             self._save_pending()
         return len(keys)
 
+    def pending_entry_by_flag(self, flag: str) -> dict | None:
+        """按 flag 找待审批登记（文本兜底审批时用于取回 sub_type）。"""
+        if not flag:
+            return None
+        return next((r for r in self.pending.values() if r.get("flag") == flag), None)
+
     def _drop_stale(self, now: float) -> None:
         """清理远超上限的登记，防止内存无限增长（用宽口径，各群新鲜期只在计数时收紧）。"""
         threshold = now - PENDING_MAX_TTL
@@ -107,6 +113,7 @@ class JoinState:
             and isinstance(v.get("gid"), str)
             and isinstance(v.get("uid"), str)
             and isinstance(v.get("flag"), str)
+            and v.get("sub_type", "add") in {"add", "invite"}
             and (v.get("platform_id") is None or isinstance(v.get("platform_id"), str))
             and (v.get("comment") is None or isinstance(v.get("comment"), str))
             and isinstance(v.get("ts"), (int, float))
@@ -132,13 +139,16 @@ class JoinState:
         flag: str,
         platform_id: str | None = None,
         comment: str | None = None,
+        sub_type: str = "add",
     ):
-        """登记一条待人工审批的进群申请，供管理员回复审批时精确匹配；platform_id 用于面板直接批驳时定位 bot。"""
+        """登记一条待人工审批的进群申请，供管理员回复审批时精确匹配；platform_id 用于面板直接批驳时定位 bot。
+        sub_type 跟随请求事件（add 主动申请 / invite 邀请入群），审批时必须原样回传。"""
         self.pending[key] = {
             "gid": gid,
             "uid": uid,
             "nickname": nickname,
             "flag": flag,
+            "sub_type": sub_type,
             "platform_id": platform_id,
             "comment": (str(comment).strip()[:500] if comment else ""),
             "ts": time.time(),

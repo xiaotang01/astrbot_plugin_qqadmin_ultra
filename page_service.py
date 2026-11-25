@@ -27,6 +27,8 @@ from .utils import parse_bool
 
 DEFAULT_GROUP_ID = "__default__"
 FOLLOW_DEFAULT_KEY = "follow_default"
+# 跟随主群配置：库内以 __follow_master__ 记录主群 id，接口里以同名键回传布尔值
+FOLLOW_MASTER_KEY = "__follow_master__"
 
 
 class QQAdminPageService:
@@ -85,6 +87,16 @@ class QQAdminPageService:
             },
             "groups": await self.list_groups(),
             "refresh_error": self.group_cache.last_refresh_error,
+            "join_single": self.join_single_state(),
+        }
+
+    def join_single_state(self) -> dict[str, Any]:
+        """面板用的“禁止多群加入”类型划分：主群、被归类群、全局模板是否开启。"""
+        state = self.db.single_group_state()
+        return {
+            "global": bool(self.db.default_cfg.get("join_single_group", False)),
+            "masters": state["masters"],
+            "locks": state["locks"],
         }
 
     def _default_group_summary(self) -> dict[str, Any]:
@@ -120,7 +132,11 @@ class QQAdminPageService:
     async def list_groups_with_status(self, force: bool = False, with_details: bool = True) -> dict[str, Any]:
         """群列表 + 最近一次刷新错误，供面板展示刷新失败原因（手动同步默认附带实时详情校准人数）。"""
         groups = await self.list_groups(force=force, with_details=with_details, prune=False)
-        return {"groups": groups, "refresh_error": self.group_cache.last_refresh_error}
+        return {
+            "groups": groups,
+            "refresh_error": self.group_cache.last_refresh_error,
+            "join_single": self.join_single_state(),
+        }
 
     async def calibrate_groups(self) -> dict[str, Any]:
         """详情校准：只刷新缓存中已有群的实时人数/群名，不重拉整表、不删库；返回失败群供面板点名。"""
@@ -178,10 +194,19 @@ class QQAdminPageService:
             "group_info": group_info,
             "config": {
                 FOLLOW_DEFAULT_KEY: follow_default,
+                FOLLOW_MASTER_KEY: self._follow_master_active(group_id),
                 **self.db.get_group_snapshot(group_id),
             },
             "is_default_group": False,
+            "join_single": self.join_single_state(),
         }
+
+    def _follow_master_active(self, group_id: str) -> bool:
+        """仅当记录的跟随主群与当前类型划分一致时才算生效，避免主群消失后卡在跟随态。"""
+        master = self.db.follow_master_of(group_id)
+        if not master:
+            return False
+        return self.db.single_group_state()["locks"].get(group_id) == master
 
     async def update_group_config(self, group_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         if str(group_id).strip() == DEFAULT_GROUP_ID:
@@ -190,16 +215,29 @@ class QQAdminPageService:
         group_id = self._normalize_group_id(group_id)
         current = self.db.get_group_snapshot(group_id)
         follow_default_current = self.db.is_group_follow_default(group_id)
+        follow_master = bool(payload.get(FOLLOW_MASTER_KEY, False))
+        previous_members = set(self.db.single_group_state()["masters"].get(group_id, []))
         sanitized = self._sanitize_value(
             payload,
             {"type": "object", "items": self.group_schema},
             {FOLLOW_DEFAULT_KEY: follow_default_current, **current},
         )
         follow_default = bool(sanitized.pop(FOLLOW_DEFAULT_KEY, True))
+        master_id = self.db.single_group_state()["locks"].get(group_id)
         if follow_default:
             await self.db.follow_default(group_id)
+            await self._sync_master_followers(group_id, None, set(), previous_members)
+        elif follow_master and master_id:
+            # 跟随主群：整份配置取自主群当前快照，接口提交的其他字段忽略
+            await self.db.replace_group(group_id, self._follow_master_record(master_id))
+            await self._sync_master_followers(group_id, None, set(), previous_members)
         else:
+            sanitized = self._normalize_single_group_config(group_id, sanitized)
             await self.db.replace_group(group_id, sanitized)
+            new_members = set()
+            if sanitized.get("join_single_group"):
+                new_members = set(self.db.single_group_state()["masters"].get(group_id, []))
+            await self._sync_master_followers(group_id, sanitized, new_members, previous_members)
         self.group_cache.invalidate(group_id)
 
         # 返回轻量结果：优先用列表缓存摘要，避免保存后又拉一次详情
@@ -216,9 +254,11 @@ class QQAdminPageService:
             "group_info": group_info,
             "config": {
                 FOLLOW_DEFAULT_KEY: follow_default,
+                FOLLOW_MASTER_KEY: self._follow_master_active(group_id),
                 **self.db.get_group_snapshot(group_id),
             },
             "is_default_group": False,
+            "join_single": self.join_single_state(),
         }
 
     async def reset_group_config(self, group_id: str) -> dict[str, Any]:
@@ -226,7 +266,9 @@ class QQAdminPageService:
             raise ValueError("default group does not support reset")
 
         group_id = self._normalize_group_id(group_id)
+        previous_members = set(self.db.single_group_state()["masters"].get(group_id, []))
         await self.db.follow_default(group_id)
+        await self._sync_master_followers(group_id, None, set(), previous_members)
         self.group_cache.invalidate(group_id)
         return await self.get_group_config(group_id)
 
@@ -249,6 +291,8 @@ class QQAdminPageService:
             {FOLLOW_DEFAULT_KEY: False, **current},
         )
         sanitized.pop(FOLLOW_DEFAULT_KEY, None)
+        # 同类型群聊是单群概念，不写入全局模板（全局开启即所有群同类型）
+        sanitized.pop("join_single_groups", None)
         self._apply_group_level_updates(sanitized)
         self.db.default_cfg = self.cfg.build_group_default_config()
         self.cfg.refresh_runtime_settings()
@@ -439,6 +483,69 @@ class QQAdminPageService:
         if not gid or not gid.isdigit():
             raise ValueError("group_id must be a numeric string")
         return gid
+
+    def _normalize_single_group_config(self, group_id: str, config: dict[str, Any]) -> dict[str, Any]:
+        """保存单群配置时校验“禁止多群加入”的群类型设置。
+
+        被其他主群归类的群不能再开启该功能；主群的同类型群列表需去掉自身、
+        其他主群及其他主群已归类的群。全局模板开启时所有群视为同一类型，列表不生效。
+        """
+        global_single = bool(self.db.default_cfg.get("join_single_group", False))
+        items = self._clean_group_id_list(group_id, config.get("join_single_groups"))
+        config["join_single_groups"] = items
+        if global_single:
+            return config
+        state = self.db.single_group_state(skip_members_of=group_id)
+        if group_id in state["locks"]:
+            config["join_single_group"] = False
+            config["join_single_groups"] = []
+            return config
+        if config.get("join_single_group"):
+            config["join_single_groups"] = [
+                gid for gid in items if gid not in state["masters"] and gid not in state["locks"]
+            ]
+        return config
+
+    @staticmethod
+    def _clean_group_id_list(group_id: str, items: Any) -> list[str]:
+        if not isinstance(items, list):
+            return []
+        cleaned: list[str] = []
+        for item in items:
+            gid = str(item).strip()
+            if gid.isdigit() and gid != group_id and gid not in cleaned:
+                cleaned.append(gid)
+        return cleaned
+
+    def _follow_master_record(self, master_id: str) -> dict[str, Any]:
+        """生成“跟随主群”的群配置：取主群快照并强制关闭本群的多群开关/列表。"""
+        data = copy.deepcopy(self.db.get_group_snapshot(master_id))
+        data["join_single_group"] = False
+        data["join_single_groups"] = []
+        data[FOLLOW_MASTER_KEY] = master_id
+        return data
+
+    async def _sync_master_followers(
+        self,
+        master_id: str,
+        master_config: dict[str, Any] | None,
+        members: set[str],
+        previous_members: set[str],
+    ) -> None:
+        """主群保存后同步其跟随者；被移出类型的群解除跟随，保留最后同步的配置。"""
+        for gid in previous_members - set(members):
+            if self.db.follow_master_of(gid) == master_id:
+                await self.db.replace_group(gid, self.db.get_group_snapshot(gid))
+        if master_config is None:
+            return
+        for gid in members:
+            if self.db.follow_master_of(gid) != master_id:
+                continue
+            data = copy.deepcopy(master_config)
+            data["join_single_group"] = False
+            data["join_single_groups"] = []
+            data[FOLLOW_MASTER_KEY] = master_id
+            await self.db.replace_group(gid, data)
 
     def _apply_group_level_updates(self, updated: dict[str, Any]) -> None:
         default_fields = self.schema.get("default", {}).get("items", {})

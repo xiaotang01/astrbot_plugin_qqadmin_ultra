@@ -89,9 +89,15 @@
       },
       "join_single_group": {
         "description": "禁止多群加入",
-        "hint": "开启后，已加入或正在申请同账号管理的其他群聊的QQ号，进群时自动拒绝",
+        "hint": "开启后，已加入或正在申请同账号管理的其他群聊的QQ号，进群时自动拒绝。全局模板开启时所有群视为同一类型；单群独立配置开启时，可在下方勾选同类型群聊",
         "type": "bool",
         "default": false
+      },
+      "join_single_groups": {
+        "description": "同类型群聊",
+        "hint": "仅当本群为独立配置且开启“禁止多群加入”时可编辑。勾选的群与本群视为同一类型：同一QQ加入本类型任一群后，申请本类型其他群会被拒绝；被勾选的群将无法再开启该功能",
+        "type": "list",
+        "default": []
       },
       "join_invite_auto": {
         "description": "被邀请入群自动同意",
@@ -601,6 +607,7 @@
           "join_pending_msg",
           "join_pending_ttl",
           "join_single_group",
+          "join_single_groups",
           "join_invite_auto",
           "reject_word_block",
           "join_silent_reasons",

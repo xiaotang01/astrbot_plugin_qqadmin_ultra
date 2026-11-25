@@ -14,6 +14,7 @@ const DEFAULT_GROUP_ID = "__default__";
 const COLLAPSED_GROUP_OBJECT_PATHS = new Set(["perms"]);
 const EXPANDED_GROUP_OBJECT_PATHS = new Set(["vote_ban"]);
 const FOLLOW_DEFAULT_KEY = "follow_default";
+const FOLLOW_MASTER_KEY = "__follow_master__";
 
 let api = null;
 let bootstrapData = null;
@@ -116,14 +117,67 @@ function buildGroupFormValues(groupPayload) {
   };
 }
 
+function getJoinSingleInfo() {
+  const info = bootstrapData?.join_single || {};
+  return {
+    global: Boolean(info.global),
+    masters: info.masters || {},
+    locks: info.locks || {},
+  };
+}
+
+function applyJoinSingleState(state) {
+  if (bootstrapData && state && typeof state === "object") {
+    bootstrapData.join_single = state;
+  }
+}
+
+function getJoinSingleLockMaster(ignoreGlobal = false) {
+  if (!currentGroup || currentGroup.is_default_group) {
+    return null;
+  }
+  const info = getJoinSingleInfo();
+  if (info.global && !ignoreGlobal) {
+    return null;
+  }
+  const masterId = info.locks[String(currentGroup.group_id)];
+  if (!masterId) {
+    return null;
+  }
+  const master = allGroups.find(
+    (group) => String(group.group_id) === String(masterId)
+  );
+  return { id: String(masterId), name: master?.group_name || String(masterId) };
+}
+
 function isGroupFieldDisabled(path) {
   if (!currentGroup || currentGroup.is_default_group) {
     return false;
   }
-  if (!currentGroup.config?.[FOLLOW_DEFAULT_KEY]) {
-    return false;
+  const following = Boolean(currentGroup.config?.[FOLLOW_DEFAULT_KEY]);
+  const followingMaster = Boolean(currentGroup.config?.[FOLLOW_MASTER_KEY]);
+  if (path === FOLLOW_DEFAULT_KEY) {
+    return followingMaster;
   }
-  return path !== FOLLOW_DEFAULT_KEY;
+  if (path === FOLLOW_MASTER_KEY) {
+    return following;
+  }
+  if (following || followingMaster) {
+    return true;
+  }
+  if (path === "join_single_group") {
+    return Boolean(getJoinSingleLockMaster());
+  }
+  if (path === "join_single_groups") {
+    if (getJoinSingleInfo().global) {
+      return true;
+    }
+    return (
+      Boolean(getJoinSingleLockMaster()) ||
+      !currentGroup.config?.join_single_group
+    );
+  }
+  return false;
 }
 
 function updateGroupActionState() {
@@ -198,29 +252,101 @@ function updateActiveGroupCard() {
   });
 }
 
-function setFieldsDisabled(disabled) {
+// 跟随默认 / 跟随主群两个开关互斥：任一开启时其余字段全部置灰
+function applyFollowStates() {
+  if (!currentGroup) {
+    return;
+  }
+  const followingDefault = Boolean(currentGroup.config?.[FOLLOW_DEFAULT_KEY]);
+  const followingMaster = Boolean(currentGroup.config?.[FOLLOW_MASTER_KEY]);
+  const disabled = followingDefault || followingMaster;
   els.groupForm.querySelectorAll("[data-path]").forEach((node) => {
-    if (node.dataset.path === FOLLOW_DEFAULT_KEY) {
-      return;
+    const path = node.dataset.path;
+    if (path === FOLLOW_DEFAULT_KEY) {
+      node.disabled = followingMaster;
+    } else if (path === FOLLOW_MASTER_KEY) {
+      node.disabled = followingDefault;
+    } else {
+      node.disabled = disabled;
     }
-    node.disabled = disabled;
   });
   els.groupForm.querySelectorAll(".field, .form-object").forEach((field) => {
     field.classList.toggle("is-disabled", disabled);
   });
+  applyJoinSingleStates();
+}
+
+function buildJoinSingleSchema(rawSchema, groupPayload) {
+  const field = rawSchema.join_single_groups;
+  if (!field) {
+    return rawSchema;
+  }
+  const schema = {
+    ...rawSchema,
+    join_single_groups: { ...field },
+  };
+  const groupId = String(groupPayload?.group_id || "");
+  const info = getJoinSingleInfo();
+  // 全局开启时“锁定”不再限制功能开关，但已跟随主群的群仍需展示“跟随主群配置”
+  const lockMaster = getJoinSingleLockMaster(true);
+  if (lockMaster && !info.global) {
+    schema.join_single_group = {
+      ...rawSchema.join_single_group,
+      hint: `本群已被群 ${lockMaster.name}(${lockMaster.id}) 归为同一类型，无法开启该功能`,
+    };
+  } else if (info.global) {
+    schema.join_single_groups.hint =
+      "全局模板已开启“禁止多群加入”，所有群视为同一类型，无需单独勾选";
+  }
+  const candidates = allGroups.filter((group) => {
+    const id = String(group.group_id || "");
+    if (!id || id === DEFAULT_GROUP_ID || id === groupId) {
+      return false;
+    }
+    // 其他主群、以及其他主群归类的群不可选；本群自己归类的群仍要显示为已选中
+    const lockedBy = info.locks[id];
+    return !info.masters[id] && (!lockedBy || String(lockedBy) === groupId);
+  });
+  schema.join_single_groups.options = candidates.map((group) =>
+    String(group.group_id)
+  );
+  schema.join_single_groups.labels = candidates.map(
+    (group) => `${group.group_name || group.group_id}(${group.group_id})`
+  );
+  if (!lockMaster) {
+    return schema;
+  }
+  // 被主群绑定的群额外提供“跟随主群配置”，紧跟“跟随默认配置”之后
+  const ordered = {};
+  Object.entries(schema).forEach(([key, value]) => {
+    ordered[key] = value;
+    if (key === FOLLOW_DEFAULT_KEY) {
+      ordered[FOLLOW_MASTER_KEY] = {
+        description: "跟随主群配置",
+        hint: `开启后整份配置同步自主群 ${lockMaster.name}(${lockMaster.id})，与“跟随默认配置”互斥；主群取消绑定后恢复独立配置`,
+        type: "bool",
+        default: false,
+      };
+    }
+  });
+  return ordered;
 }
 
 function renderGroupForm(groupPayload) {
   currentGroup = groupPayload;
+  applyJoinSingleState(groupPayload?.join_single);
 
   renderGroupDetailHeader(els, groupPayload);
   const rawSchema = bootstrapData.schema.group || {};
-  // 默认群模板本身就是被跟随的对象，不需要"跟随默认配置"开关
+  // 默认群模板本身就是被跟随的对象，不需要"跟随默认配置"开关；
+  // 同类型群聊是单群概念，全局模板不展示
   const schema = groupPayload?.is_default_group
     ? Object.fromEntries(
-        Object.entries(rawSchema).filter(([key]) => key !== FOLLOW_DEFAULT_KEY)
+        Object.entries(rawSchema).filter(
+          ([key]) => key !== FOLLOW_DEFAULT_KEY && key !== "join_single_groups"
+        )
       )
-    : rawSchema;
+    : buildJoinSingleSchema(rawSchema, groupPayload);
   renderSchemaFields(
     els.groupForm,
     schema,
@@ -231,12 +357,15 @@ function renderGroupForm(groupPayload) {
       expandedObjectPaths: EXPANDED_GROUP_OBJECT_PATHS,
       isFieldDisabled: isGroupFieldDisabled,
       // 跟随开关置顶；投票禁言/权限管理等无分组项沉底
-      leadingPaths: [FOLLOW_DEFAULT_KEY],
+      leadingPaths: [FOLLOW_DEFAULT_KEY, FOLLOW_MASTER_KEY],
       // 面板分组定义表（组名/组说明/成员/排序），来自 schema
       groups: bootstrapData.schema.groups || {},
     }
   );
   bindFollowDefaultToggle();
+  bindFollowMasterToggle();
+  bindJoinSingleControls();
+  applyFollowStates();
   updateGroupActionState();
   updateActiveGroupCard();
 }
@@ -272,6 +401,7 @@ async function syncGroupRoles(requestToken, options = {}) {
 async function refreshGroupsListOnly() {
   const result = await api.safePost("settings/groups/refresh", { details: "0" });
   groupListError = result.refresh_error || null;
+  applyJoinSingleState(result.join_single);
   applyGroupList(result.groups || []);
   if (groupListError) {
     showToast(groupListError, "error");
@@ -324,10 +454,91 @@ function bindFollowDefaultToggle() {
     }
     const following = Boolean(followDefaultInput.checked);
     currentGroup.config[FOLLOW_DEFAULT_KEY] = following;
+    if (following) {
+      // 与“跟随主群配置”互斥
+      currentGroup.config[FOLLOW_MASTER_KEY] = false;
+      const masterInput = els.groupForm.querySelector(
+        `[data-path="${FOLLOW_MASTER_KEY}"]`
+      );
+      if (masterInput) {
+        masterInput.checked = false;
+      }
+    }
     // 轻量切换：仅翻转禁用态，不重建整个表单
-    setFieldsDisabled(following);
+    applyFollowStates();
     updateGroupActionState();
     updateActiveGroupCard();
+  });
+}
+
+function bindFollowMasterToggle() {
+  const masterInput = els.groupForm.querySelector(
+    `[data-path="${FOLLOW_MASTER_KEY}"]`
+  );
+  if (!masterInput) {
+    return;
+  }
+  masterInput.addEventListener("change", () => {
+    if (!currentGroup?.config) {
+      return;
+    }
+    const following = Boolean(masterInput.checked);
+    currentGroup.config[FOLLOW_MASTER_KEY] = following;
+    if (following) {
+      // 与“跟随默认配置”互斥
+      currentGroup.config[FOLLOW_DEFAULT_KEY] = false;
+      const defaultInput = els.groupForm.querySelector(
+        `[data-path="${FOLLOW_DEFAULT_KEY}"]`
+      );
+      if (defaultInput) {
+        defaultInput.checked = false;
+      }
+    }
+    applyFollowStates();
+    updateGroupActionState();
+    updateActiveGroupCard();
+  });
+}
+
+function applyJoinSingleStates() {
+  if (!currentGroup || currentGroup.is_default_group) {
+    return;
+  }
+  const following =
+    Boolean(currentGroup.config?.[FOLLOW_DEFAULT_KEY]) ||
+    Boolean(currentGroup.config?.[FOLLOW_MASTER_KEY]);
+  const locked = Boolean(getJoinSingleLockMaster());
+  const globalOn = getJoinSingleInfo().global;
+  const toggle = els.groupForm.querySelector('[data-path="join_single_group"]');
+  if (toggle) {
+    const toggleField = toggle.closest(".field");
+    toggle.disabled = following || locked;
+    toggleField?.classList.toggle("is-disabled", following || locked);
+  }
+  const listField = els.groupForm
+    .querySelector('[data-path="join_single_groups"]')
+    ?.closest(".field");
+  if (!listField) {
+    return;
+  }
+  const editable =
+    !following && !locked && !globalOn && Boolean(toggle?.checked);
+  listField.querySelectorAll('input[type="checkbox"]').forEach((box) => {
+    box.disabled = !editable;
+  });
+  listField.classList.toggle("is-disabled", !editable);
+}
+
+function bindJoinSingleControls() {
+  const toggle = els.groupForm.querySelector('[data-path="join_single_group"]');
+  if (!toggle) {
+    return;
+  }
+  toggle.addEventListener("change", () => {
+    if (currentGroup?.config) {
+      currentGroup.config.join_single_group = Boolean(toggle.checked);
+    }
+    applyJoinSingleStates();
   });
 }
 

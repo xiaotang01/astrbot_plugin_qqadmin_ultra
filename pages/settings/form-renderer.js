@@ -135,7 +135,8 @@ function buildField(path, key, schema, value, options = {}) {
 
   // 复选框组含多个可点击控件且内层已是 label，外层必须用 div：
   // label 嵌套 label 是非法 HTML，点击空白/文字会误触发第一个复选框
-  const useDivWrapper = type === "list" && (schema.options?.length || 0) > 0;
+  // 传了 options 数组（即使为空）也按复选框组渲染，空选项由调用方注明“暂无可选”
+  const useDivWrapper = type === "list" && Array.isArray(schema.options);
   const field = document.createElement(useDivWrapper ? "div" : "label");
   field.className = "field";
   if (type === "bool") {
@@ -201,7 +202,7 @@ function buildField(path, key, schema, value, options = {}) {
     }
     control.appendChild(input);
   } else if (type === "list") {
-    if (schema.options?.length) {
+    if (Array.isArray(schema.options)) {
       // 带固定选项的列表渲染为复选框组；展示文本优先取 options 对象自带的 label，
       // 其次取与 options 等长的 labels 数组（AstrBot 官方机制），最后回退为值本身
       const selected = new Set(
@@ -225,6 +226,12 @@ function buildField(path, key, schema, value, options = {}) {
         label.append(box, document.createTextNode(optionLabel));
         group.appendChild(label);
       });
+      if (!schema.options.length) {
+        const empty = document.createElement("div");
+        empty.className = "field-hint";
+        empty.textContent = "暂无可选群聊";
+        group.appendChild(empty);
+      }
       control.appendChild(group);
       input = null;
     } else {

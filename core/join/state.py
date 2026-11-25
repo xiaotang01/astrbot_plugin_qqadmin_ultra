@@ -195,8 +195,11 @@ class JoinState:
             if not groups:
                 self.applied.pop(u, None)
 
-    def find_earlier_application(self, uid: str, gid: str) -> str | None:
-        """查找同一用户在其他群更早的待定申请，返回群名（无则返回 None）。"""
+    def find_earlier_application(self, uid: str, gid: str, scope: set[str] | None = None) -> str | None:
+        """查找同一用户在其他群更早的待定申请，返回群名（无则返回 None）。
+
+        scope 为 None 表示所有群都参与比较；否则只比较 scope 内的群（同类型群）。
+        """
         recs = self.applied.get(uid, {})
         mine = recs.get(gid)
         if not mine:
@@ -205,6 +208,8 @@ class JoinState:
         earliest = None
         for g, r in recs.items():
             if g == gid:
+                continue
+            if scope is not None and g not in scope:
                 continue
             key = (r.get("ts", 0), g)
             if key < my_key and (earliest is None or key < earliest[0]):

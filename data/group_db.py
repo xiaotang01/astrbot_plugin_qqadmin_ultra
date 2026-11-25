@@ -16,14 +16,19 @@ class QQAdminDB:
     """
 
     FOLLOW_DEFAULT_MARKER = "__follow_default__"
+    FOLLOW_MASTER_MARKER = "__follow_master__"
 
     # ================================================================
 
     def __init__(self, config: PluginConfig):
         self.db_path = config.db_path
 
-        # 默认字段（动态配置核心）
-        self.default_cfg: dict = config.default
+        # 默认字段（动态配置核心）：以 schema 为键来源，保证新增字段有默认值，
+        # 否则历史群配置里的新字段会被 _reconcile_group_data 当作已废弃键删掉
+        try:
+            self.default_cfg: dict = config.build_group_default_config()
+        except Exception:
+            self.default_cfg = config.default
 
         self._conn = None
         self._cache = {}
@@ -97,7 +102,11 @@ class QQAdminDB:
     def _strip_meta_fields(self, data: dict | None) -> dict | None:
         if data is None:
             return None
-        return {key: copy.deepcopy(value) for key, value in data.items() if key != self.FOLLOW_DEFAULT_MARKER}
+        return {
+            key: copy.deepcopy(value)
+            for key, value in data.items()
+            if key not in (self.FOLLOW_DEFAULT_MARKER, self.FOLLOW_MASTER_MARKER)
+        }
 
     def _legacy_values_match_defaults(self, data: dict) -> bool:
         """仅供 init 迁移：无 marker 历史行按值判定（迁移后不再使用）。"""
@@ -121,6 +130,14 @@ class QQAdminDB:
     def is_group_follow_default(self, gid: str) -> bool:
         return self._is_follow_default_data(self._cache.get(gid))
 
+    def follow_master_of(self, gid: str) -> str | None:
+        """返回该群跟随的主群 id；未跟随主群返回 None。"""
+        record = self._cache.get(gid)
+        if not isinstance(record, dict):
+            return None
+        master = record.get(self.FOLLOW_MASTER_MARKER)
+        return str(master) if master else None
+
     def _build_explicit_group_record(self, data: dict | None = None) -> dict:
         base = copy.deepcopy(data if data is not None else self.default_cfg)
         base[self.FOLLOW_DEFAULT_MARKER] = False
@@ -134,7 +151,8 @@ class QQAdminDB:
         只调整结构，不覆盖已存在的值（默认值变化不会抹掉用户的显式配置）。
         """
         changed = False
-        for key in [k for k in data if k != self.FOLLOW_DEFAULT_MARKER and k not in defaults]:
+        meta_keys = (self.FOLLOW_DEFAULT_MARKER, self.FOLLOW_MASTER_MARKER)
+        for key in [k for k in data if k not in meta_keys and k not in defaults]:
             data.pop(key, None)
             changed = True
         for key, default in defaults.items():
@@ -171,6 +189,40 @@ class QQAdminDB:
             data = self._strip_meta_fields(raw) or {}
         self._reconcile_group_data(data, self.default_cfg)
         return data
+
+    def single_group_state(self, skip_members_of: str | None = None) -> dict[str, dict]:
+        """计算“禁止多群加入”的群类型划分。
+
+        只有显式配置（非跟随默认）且开启 join_single_group 的群才是主群，
+        主群 join_single_groups 里勾选的群与之同类型。返回：
+        {"masters": {主群: [同类群...]}, "locks": {被归类群: 主群}}
+        冲突时先出现的主群优先；主群不能再被其他主群归类。
+        `skip_members_of` 用于保存某个群时忽略它当前的归类关系（旧列表），
+        但仍保留其“主群”身份，避免它被其他主群抢占。
+        """
+        raw_masters: dict[str, list[str]] = {}
+        for gid in self.list_group_ids():
+            if self.is_group_follow_default(gid):
+                continue
+            rec = self._strip_meta_fields(self._cache.get(gid)) or {}
+            if not rec.get("join_single_group"):
+                continue
+            members: list[str] = []
+            if gid != skip_members_of:
+                for item in rec.get("join_single_groups") or []:
+                    member = str(item).strip()
+                    if member and member != gid and member.isdigit() and member not in members:
+                        members.append(member)
+            raw_masters[gid] = members
+
+        masters = {m: [x for x in members if x not in raw_masters] for m, members in raw_masters.items()}
+        locks: dict[str, str] = {}
+        for master, members in masters.items():
+            for member in members:
+                if member in masters or member in locks:
+                    continue
+                locks[member] = master
+        return {"masters": masters, "locks": locks}
 
     # ============================== API ==============================
 
@@ -242,12 +294,18 @@ class QQAdminDB:
     # ============================== 删除群配置 ==============================
 
     async def delete_group(self, gid: str):
-        """彻底删除群配置"""
+        """彻底删除群配置；原本跟随该群配置的群转为独立配置（保留最后同步值）。"""
         async with self._write_lock:
             if self._conn:
                 await self._conn.execute("DELETE FROM groups WHERE group_id = ?", (gid,))
                 await self._conn.commit()
             self._cache.pop(gid, None)
+            for other_gid in [g for g in self._cache if self.follow_master_of(g) == gid]:
+                record = self._cache[other_gid]
+                if isinstance(record, dict):
+                    record.pop(self.FOLLOW_MASTER_MARKER, None)
+                    if self._conn:
+                        await self._save_to_db(other_gid, record)
 
     # ============================== 关闭 ==============================
 

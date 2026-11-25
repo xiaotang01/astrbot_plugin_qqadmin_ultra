@@ -106,8 +106,14 @@ class JoinReviewer:
                 cleared += self.state.drop_pending(lambda k, r, uid=uid: r.get("gid") == gid and r.get("uid") == uid)
         return cleared
 
-    async def _find_other_group(self, gid: str, uid: str, client=None) -> str | None:
-        """检查用户是否已在同账号管理的其他群中，返回群名，否返回 None。"""
+    async def _find_other_group(
+        self, gid: str, uid: str, client=None, scope: set[str] | None = None
+    ) -> str | None:
+        """检查用户是否已在同类型群中，返回群名，否返回 None。
+
+        scope 为 None 表示所有群都视为同一类型（全局开启时的原有行为）；
+        否则只检查 scope 内的群（主群及其勾选的同类型群）。
+        """
         if client is None or not self._group_cache:
             return None
         try:
@@ -115,11 +121,16 @@ class JoinReviewer:
         except Exception as e:
             logger.debug(f"获取群列表失败，跳过多群检查: {e}")
             return None
-        others = [
-            (str(g.get("group_id", "")), g.get("group_name", "") or str(g.get("group_id", "")))
-            for g in groups
-            if isinstance(g, dict) and str(g.get("group_id", "")) and str(g.get("group_id", "")) != gid
-        ]
+        others: list[tuple[str, str]] = []
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            ngid = str(g.get("group_id", ""))
+            if not ngid or ngid == gid:
+                continue
+            if scope is not None and ngid not in scope:
+                continue
+            others.append((ngid, g.get("group_name", "") or ngid))
         if not others:
             return None
 
@@ -157,9 +168,23 @@ class JoinReviewer:
     async def _load_snapshot(self, gid: str, uid: str, client=None) -> GroupJoinSnapshot:
         """一次加载判定所需的全部输入（含条件 IO：开关关闭时不触发网络探测）。"""
         full_reject = await self.db.get(gid, "join_full_reject", True)
+        # 禁止多群加入：全局模板开启时所有群视为同一类型（保持原行为）；
+        # 否则按“主群 + 勾选的同类型群”生效，被归类的群同样执行检查。
+        global_single = bool(self.db.default_cfg.get("join_single_group", False))
         single_group = await self.db.get(gid, "join_single_group", False)
-        other = await self._find_other_group(gid, uid, client) if single_group else None
-        earlier = self.state.find_earlier_application(uid, gid) if single_group and not other else None
+        scope: set[str] | None = None
+        if global_single:
+            apply_single = bool(single_group)
+        else:
+            type_state = self.db.single_group_state()
+            master = gid if single_group else type_state["locks"].get(gid)
+            apply_single = bool(master)
+            if master:
+                scope = {master, *type_state["masters"].get(master, [])}
+        other = await self._find_other_group(gid, uid, client, scope) if apply_single else None
+        earlier = (
+            self.state.find_earlier_application(uid, gid, scope) if apply_single and not other else None
+        )
         max_fail = await self.db.get(gid, "join_max_time", 3)
         counts = await self._group_counts(gid, client) if full_reject else None
         slots_left = counts[1] - counts[0] if counts else None
@@ -177,7 +202,7 @@ class JoinReviewer:
             join_pending_msg=await self.db.get(gid, "join_pending_msg", "待审核人数已超过剩余名额"),
             slots_left=counts[1] - counts[0] if counts else None,
             pending_count=pending_count,
-            join_single_group=single_group,
+            join_single_group=apply_single,
             other_group=other,
             earlier_group=earlier,
             allow_ids=await resolve_allow_ids(self.db, self.global_list, gid),
